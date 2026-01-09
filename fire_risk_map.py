@@ -21,6 +21,7 @@ import math
 import random
 import sys
 import time
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -537,10 +538,11 @@ Cities: Sydney, Melbourne, Brisbane, Perth, Adelaide, Darwin, Hobart, Canberra, 
     parser.add_argument("--no-map", action="store_true", help="Skip PNG map")
     parser.add_argument("--csv", action="store_true", help="Export CSV")
     parser.add_argument("--json", action="store_true", help="Export JSON")
-    parser.add_argument("--interactive", action="store_true", help="Generate HTML map")
+    parser.add_argument("--no-html", action="store_true", help="Skip HTML map generation")
     parser.add_argument("--heatmap", action="store_true", help="Use heatmap style")
     parser.add_argument("--simulate", action="store_true", help="Use simulated data (no API)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for simulation")
+    parser.add_argument("--no-open", action="store_true", help="Don't open HTML in browser")
 
     args = parser.parse_args()
 
@@ -593,9 +595,11 @@ Cities: Sydney, Melbourne, Brisbane, Perth, Adelaide, Darwin, Hobart, Canberra, 
         create_matplotlib_map(grid.lats, grid.lons, risk_levels, ffdi,
                               f"Fire Risk - {region_name}", str(output_dir / f"{prefix}.png"), bounds)
 
-    if args.interactive:
+    html_path = None
+    if not args.no_html:
+        html_path = str(output_dir / f"{prefix}.html")
         create_folium_map(grid.lats, grid.lons, risk_levels, ffdi, risk_categories,
-                          str(output_dir / f"{prefix}.html"), bounds, args.heatmap)
+                          html_path, bounds, args.heatmap)
 
     if args.csv:
         export_csv(grid.lats, grid.lons, risk_levels, ffdi, risk_categories, weather,
@@ -606,6 +610,11 @@ Cities: Sydney, Melbourne, Brisbane, Perth, Adelaide, Darwin, Hobart, Canberra, 
                     {"region": region_name, "resolution_km": args.resolution,
                      "simulated": args.simulate, "generated": datetime.now().isoformat()},
                     str(output_dir / f"{prefix}.json"))
+
+    # Open HTML in browser
+    if html_path and not args.no_open:
+        print(f"\nOpening map in browser...")
+        webbrowser.open(f"file://{Path(html_path).absolute()}")
 
     print(f"\n{'='*60}\nDONE! Output: {output_dir.absolute()}\n{'='*60}\n")
 
