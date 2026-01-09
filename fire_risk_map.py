@@ -446,22 +446,37 @@ def create_folium_map(lats: np.ndarray, lons: np.ndarray, risk_levels: np.ndarra
     center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
     center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles='OpenStreetMap')
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles='cartodbpositron')
 
-    if use_heatmap:
-        HeatMap([[lat, lon, ffdi] for lat, lon, ffdi in zip(lats, lons, ffdi_values)],
-                radius=15, blur=10).add_to(m)
-    else:
-        for i in range(len(lats)):
-            folium.CircleMarker(
-                [lats[i], lons[i]], radius=4, color=RISK_COLORS[risk_levels[i]],
-                fill=True, fillColor=RISK_COLORS[risk_levels[i]], fillOpacity=0.7,
-                popup=f"FFDI: {ffdi_values[i]:.1f}<br>Risk: {risk_categories[i]}"
-            ).add_to(m)
+    # Always use heatmap-style for better visualization
+    # Create a feature group for the colored grid
+    from folium.plugins import HeatMap
 
-    legend = '<div style="position:fixed;bottom:50px;left:50px;z-index:1000;background:white;padding:10px;border:2px solid gray;border-radius:5px;"><b>Fire Danger</b><br>'
+    # Use HeatMap with FFDI values for smooth visualization
+    heat_data = [[lat, lon, min(ffdi, 100)] for lat, lon, ffdi in zip(lats, lons, ffdi_values)]
+
+    # Custom gradient matching fire danger colors
+    gradient = {
+        0.0: '#4CAF50',   # Green - Low
+        0.12: '#4CAF50',  # Green - Low
+        0.25: '#2196F3',  # Blue - High
+        0.50: '#FFEB3B',  # Yellow - Very High
+        0.75: '#FF9800',  # Orange - Severe
+        0.90: '#F44336',  # Red - Extreme
+        1.0: '#9C27B0'    # Purple - Catastrophic
+    }
+
+    HeatMap(heat_data, radius=12, blur=8, max_zoom=10, gradient=gradient).add_to(m)
+
+    # Add legend
+    legend = '''
+    <div style="position:fixed;bottom:50px;left:50px;z-index:1000;background:white;
+                padding:15px;border:2px solid gray;border-radius:8px;font-family:Arial;">
+    <b style="font-size:14px;">Fire Danger Rating</b><br><br>
+    '''
     for lvl, lbl in RISK_LABELS.items():
-        legend += f'<i style="background:{RISK_COLORS[lvl]};width:12px;height:12px;display:inline-block;margin-right:5px;"></i>{lbl}<br>'
+        legend += f'<div style="margin:3px 0;"><span style="background:{RISK_COLORS[lvl]};width:20px;height:14px;display:inline-block;margin-right:8px;border:1px solid #333;"></span>{lbl}</div>'
+    legend += '<br><small>FFDI Max: {:.1f}</small>'.format(ffdi_values.max())
     legend += '</div>'
     m.get_root().html.add_child(folium.Element(legend))
 
