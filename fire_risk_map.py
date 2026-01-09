@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-Australia Fire Risk Map - Single File Version
+Australia Fire Risk Map - Single File Version (Optimized)
 
-A Python application that fetches weather data from Open-Meteo and calculates
-fire risk across Australia using the McArthur Forest Fire Danger Index (FFDI).
+Fast fire risk calculation using Open-Meteo's batch API.
+Defaults to Victoria state with 5km resolution.
 
 Usage:
-    python fire_risk_map.py --simulate --city Sydney --interactive
-    python fire_risk_map.py --simulate --resolution 100
-    python fire_risk_map.py --city Melbourne --csv --json
+    python fire_risk_map.py --simulate --interactive
+    python fire_risk_map.py --city Melbourne --interactive
+    python fire_risk_map.py --region australia --resolution 100
 
 Requirements:
-    pip install requests numpy pandas matplotlib aiohttp tqdm folium
+    pip install requests numpy matplotlib tqdm folium
 """
 
 import argparse
-import asyncio
 import csv
 import json
 import math
@@ -26,6 +25,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -34,12 +34,6 @@ try:
     REQUESTS_AVAILABLE = True
 except ImportError:
     REQUESTS_AVAILABLE = False
-
-try:
-    import aiohttp
-    AIOHTTP_AVAILABLE = True
-except ImportError:
-    AIOHTTP_AVAILABLE = False
 
 try:
     from tqdm import tqdm
@@ -72,18 +66,61 @@ OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 REQUIRED_DAILY_VARS = [
     "temperature_2m_max",
-    "temperature_2m_min",
-    "relative_humidity_2m_max",
     "relative_humidity_2m_min",
     "wind_speed_10m_max",
     "precipitation_sum",
 ]
 
-AUSTRALIA_BOUNDS = {
-    "min_lat": -44.0,
-    "max_lat": -10.0,
-    "min_lon": 113.0,
-    "max_lon": 154.0,
+# State/Region bounds
+REGION_BOUNDS = {
+    "victoria": {
+        "min_lat": -39.2,
+        "max_lat": -34.0,
+        "min_lon": 141.0,
+        "max_lon": 150.0,
+    },
+    "nsw": {
+        "min_lat": -37.5,
+        "max_lat": -28.2,
+        "min_lon": 141.0,
+        "max_lon": 153.6,
+    },
+    "queensland": {
+        "min_lat": -29.0,
+        "max_lat": -10.7,
+        "min_lon": 138.0,
+        "max_lon": 153.5,
+    },
+    "south_australia": {
+        "min_lat": -38.1,
+        "max_lat": -26.0,
+        "min_lon": 129.0,
+        "max_lon": 141.0,
+    },
+    "western_australia": {
+        "min_lat": -35.1,
+        "max_lat": -13.7,
+        "min_lon": 113.0,
+        "max_lon": 129.0,
+    },
+    "tasmania": {
+        "min_lat": -43.6,
+        "max_lat": -40.6,
+        "min_lon": 144.5,
+        "max_lon": 148.5,
+    },
+    "nt": {
+        "min_lat": -26.0,
+        "max_lat": -11.0,
+        "min_lon": 129.0,
+        "max_lon": 138.0,
+    },
+    "australia": {
+        "min_lat": -44.0,
+        "max_lat": -10.0,
+        "min_lon": 113.0,
+        "max_lon": 154.0,
+    },
 }
 
 AUSTRALIAN_CITIES = {
@@ -95,24 +132,19 @@ AUSTRALIAN_CITIES = {
     "Darwin": (-12.4634, 130.8456),
     "Hobart": (-42.8821, 147.3272),
     "Canberra": (-35.2809, 149.1300),
+    "Geelong": (-38.1499, 144.3617),
+    "Ballarat": (-37.5622, 143.8503),
+    "Bendigo": (-36.7570, 144.2794),
 }
 
 RISK_COLORS = {
-    0: "#4CAF50",  # Low-Moderate - Green
-    1: "#2196F3",  # High - Blue
-    2: "#FFEB3B",  # Very High - Yellow
-    3: "#FF9800",  # Severe - Orange
-    4: "#F44336",  # Extreme - Red
-    5: "#9C27B0",  # Catastrophic - Purple
+    0: "#4CAF50", 1: "#2196F3", 2: "#FFEB3B",
+    3: "#FF9800", 4: "#F44336", 5: "#9C27B0",
 }
 
 RISK_LABELS = {
-    0: "Low-Moderate",
-    1: "High",
-    2: "Very High",
-    3: "Severe",
-    4: "Extreme",
-    5: "Catastrophic",
+    0: "Low-Moderate", 1: "High", 2: "Very High",
+    3: "Severe", 4: "Extreme", 5: "Catastrophic",
 }
 
 
@@ -137,33 +169,6 @@ class Grid:
     n_cols: int
 
 
-@dataclass
-class WeatherData:
-    lat: float
-    lon: float
-    dates: List[str]
-    temp_max: List[float]
-    temp_min: List[float]
-    humidity_max: List[float]
-    humidity_min: List[float]
-    wind_speed_max: List[float]
-    precipitation: List[float]
-
-
-@dataclass
-class GridWeatherData:
-    grid: Grid
-    weather_data: List[WeatherData]
-    fetch_date: str
-
-
-@dataclass
-class FireRiskResult:
-    ffdi: float
-    risk_category: str
-    risk_level: int
-
-
 # =============================================================================
 # GRID GENERATION
 # =============================================================================
@@ -175,14 +180,12 @@ def km_to_degrees_lat(km: float) -> float:
 def km_to_degrees_lon(km: float, latitude: float) -> float:
     lat_rad = math.radians(abs(latitude))
     km_per_degree = 111.32 * math.cos(lat_rad)
-    if km_per_degree < 1:
-        km_per_degree = 1
-    return km / km_per_degree
+    return km / max(1, km_per_degree)
 
 
-def generate_australia_grid(resolution_km: float = 5.0, bounds: Optional[dict] = None) -> Grid:
+def generate_grid(resolution_km: float = 5.0, bounds: dict = None) -> Grid:
     if bounds is None:
-        bounds = AUSTRALIA_BOUNDS
+        bounds = REGION_BOUNDS["victoria"]
 
     min_lat, max_lat = bounds["min_lat"], bounds["max_lat"]
     min_lon, max_lon = bounds["min_lon"], bounds["max_lon"]
@@ -196,12 +199,8 @@ def generate_australia_grid(resolution_km: float = 5.0, bounds: Optional[dict] =
 
     n_rows, n_cols = len(lats), len(lons)
 
-    points = []
-    index = 0
-    for lat in lats:
-        for lon in lons:
-            points.append(GridPoint(lat=lat, lon=lon, index=index))
-            index += 1
+    points = [GridPoint(lat=lat, lon=lon, index=i)
+              for i, (lat, lon) in enumerate((lat, lon) for lat in lats for lon in lons)]
 
     all_lats = np.array([p.lat for p in points])
     all_lons = np.array([p.lon for p in points])
@@ -212,254 +211,188 @@ def generate_australia_grid(resolution_km: float = 5.0, bounds: Optional[dict] =
 
 def get_city_grid(city_name: str, radius_km: float = 50.0, resolution_km: float = 5.0) -> Grid:
     if city_name not in AUSTRALIAN_CITIES:
-        available = ", ".join(AUSTRALIAN_CITIES.keys())
-        raise ValueError(f"Unknown city: {city_name}. Available: {available}")
+        raise ValueError(f"Unknown city: {city_name}. Available: {', '.join(AUSTRALIAN_CITIES.keys())}")
 
     lat, lon = AUSTRALIAN_CITIES[city_name]
-    half_height_deg = km_to_degrees_lat(radius_km)
-    half_width_deg = km_to_degrees_lon(radius_km, lat)
+    half_h = km_to_degrees_lat(radius_km)
+    half_w = km_to_degrees_lon(radius_km, lat)
 
-    bounds = {
-        "min_lat": lat - half_height_deg,
-        "max_lat": lat + half_height_deg,
-        "min_lon": lon - half_width_deg,
-        "max_lon": lon + half_width_deg,
-    }
-    return generate_australia_grid(resolution_km=resolution_km, bounds=bounds)
-
-
-def estimate_grid_size(resolution_km: float, bounds: Optional[dict] = None) -> dict:
-    if bounds is None:
-        bounds = AUSTRALIA_BOUNDS
-
-    lat_range = bounds["max_lat"] - bounds["min_lat"]
-    lon_range = bounds["max_lon"] - bounds["min_lon"]
-    avg_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
-
-    lat_step = km_to_degrees_lat(resolution_km)
-    lon_step = km_to_degrees_lon(resolution_km, avg_lat)
-
-    n_rows = int(lat_range / lat_step) + 1
-    n_cols = int(lon_range / lon_step) + 1
-
-    return {"n_rows": n_rows, "n_cols": n_cols, "total_points": n_rows * n_cols}
+    bounds = {"min_lat": lat - half_h, "max_lat": lat + half_h,
+              "min_lon": lon - half_w, "max_lon": lon + half_w}
+    return generate_grid(resolution_km=resolution_km, bounds=bounds)
 
 
 # =============================================================================
-# FIRE RISK CALCULATION
+# FIRE RISK CALCULATION (Vectorized for speed)
 # =============================================================================
 
-def calculate_drought_factor(days_since_rain: int, rainfall_amount: float) -> float:
-    if days_since_rain <= 0:
-        return 0.0
+def calculate_ffdi_vectorized(temps: np.ndarray, humidity: np.ndarray,
+                               winds: np.ndarray, precip: np.ndarray) -> np.ndarray:
+    """Vectorized FFDI calculation - much faster than loops."""
+    # Estimate drought factor from precipitation
+    df = np.where(precip > 10, 2, np.where(precip > 5, 4, np.where(precip > 2, 6, np.where(precip > 0, 8, 10))))
+    df = df.astype(float)
 
-    if rainfall_amount > 30:
-        df = min(10, days_since_rain * 0.3)
-    elif rainfall_amount > 15:
-        df = min(10, days_since_rain * 0.5)
-    elif rainfall_amount > 5:
-        df = min(10, days_since_rain * 0.7)
-    else:
-        df = min(10, days_since_rain * 1.0)
+    # Clamp values
+    temps = np.clip(temps, -10, 50)
+    humidity = np.clip(humidity, 5, 100)
+    winds = np.clip(winds, 0, 150)
+    df = np.clip(df, 0.1, 10)
 
-    return max(0, min(10, df))
-
-
-def calculate_ffdi(temperature: float, relative_humidity: float,
-                   wind_speed: float, drought_factor: float) -> float:
-    if drought_factor <= 0:
-        return 0.0
-
-    temp = max(-10, min(50, temperature))
-    rh = max(5, min(100, relative_humidity))
-    wind = max(0, min(150, wind_speed))
-    df = max(0.1, min(10, drought_factor))
-
-    try:
-        ffdi = 2.0 * math.exp(
-            -0.450 + 0.987 * math.log(df) - 0.0345 * rh + 0.0338 * temp + 0.0234 * wind
-        )
-    except (ValueError, OverflowError):
-        ffdi = 0.0
-
-    return max(0, ffdi)
+    # McArthur Mark 5 FFDI formula (vectorized)
+    ffdi = 2.0 * np.exp(-0.450 + 0.987 * np.log(df) - 0.0345 * humidity + 0.0338 * temps + 0.0234 * winds)
+    return np.maximum(0, ffdi)
 
 
-def get_risk_category(ffdi: float) -> Tuple[str, int]:
-    if ffdi < 12:
-        return ("Low-Moderate", 0)
-    elif ffdi < 25:
-        return ("High", 1)
-    elif ffdi < 50:
-        return ("Very High", 2)
-    elif ffdi < 75:
-        return ("Severe", 3)
-    elif ffdi < 100:
-        return ("Extreme", 4)
-    else:
-        return ("Catastrophic", 5)
+def get_risk_levels(ffdi: np.ndarray) -> Tuple[np.ndarray, List[str]]:
+    """Vectorized risk level calculation."""
+    levels = np.zeros(len(ffdi), dtype=int)
+    levels[ffdi >= 12] = 1
+    levels[ffdi >= 25] = 2
+    levels[ffdi >= 50] = 3
+    levels[ffdi >= 75] = 4
+    levels[ffdi >= 100] = 5
 
-
-def calculate_fire_risk(temperature: float, relative_humidity: float,
-                        wind_speed: float, precipitation_sum: float) -> FireRiskResult:
-    if precipitation_sum > 10:
-        days_since_rain = 0
-    elif precipitation_sum > 5:
-        days_since_rain = 2
-    elif precipitation_sum > 2:
-        days_since_rain = 5
-    elif precipitation_sum > 0:
-        days_since_rain = 7
-    else:
-        days_since_rain = 14
-
-    df = calculate_drought_factor(days_since_rain, precipitation_sum)
-    ffdi = calculate_ffdi(temperature, relative_humidity, wind_speed, df)
-    category, level = get_risk_category(ffdi)
-
-    return FireRiskResult(ffdi=ffdi, risk_category=category, risk_level=level)
-
-
-def calculate_fire_risk_batch(temperatures: np.ndarray, humidities: np.ndarray,
-                              wind_speeds: np.ndarray, precipitations: np.ndarray
-                              ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-    n = len(temperatures)
-    ffdi_values = np.zeros(n)
-    risk_levels = np.zeros(n, dtype=int)
-    risk_categories = []
-
-    for i in range(n):
-        result = calculate_fire_risk(temperatures[i], humidities[i],
-                                     wind_speeds[i], precipitations[i])
-        ffdi_values[i] = result.ffdi
-        risk_levels[i] = result.risk_level
-        risk_categories.append(result.risk_category)
-
-    return ffdi_values, risk_levels, risk_categories
+    categories = [RISK_LABELS[l] for l in levels]
+    return levels, categories
 
 
 # =============================================================================
-# WEATHER DATA FETCHING
+# WEATHER DATA FETCHING (Optimized with batch requests)
 # =============================================================================
 
-def generate_simulated_weather(lat: float, lon: float, forecast_days: int = 3,
-                               seed: Optional[int] = None) -> WeatherData:
-    if seed is not None:
-        location_seed = int((lat * 1000 + lon * 100) % 2**31)
-        random.seed(location_seed + seed)
-
-    today = datetime.now()
-    dates = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(forecast_days)]
-
-    lat_factor = (lat + 44) / 34
-    base_temp = 20 + lat_factor * 20
-
-    temp_max, temp_min, humidity_max, humidity_min = [], [], [], []
-    wind_speed, precipitation = [], []
-
-    for _ in range(forecast_days):
-        day_temp_max = base_temp + random.gauss(0, 5) + random.uniform(-3, 3)
-        day_temp_min = day_temp_max - random.uniform(8, 15)
-
-        base_humidity = 80 - lat_factor * 30
-        day_humidity_max = min(100, base_humidity + random.uniform(10, 20))
-        day_humidity_min = max(10, base_humidity - random.uniform(20, 40))
-
-        day_wind = abs(random.gauss(15, 10))
-        day_precip = random.uniform(0.1, 20) if random.random() < 0.2 else 0.0
-
-        temp_max.append(round(day_temp_max, 1))
-        temp_min.append(round(day_temp_min, 1))
-        humidity_max.append(round(day_humidity_max, 1))
-        humidity_min.append(round(day_humidity_min, 1))
-        wind_speed.append(round(day_wind, 1))
-        precipitation.append(round(day_precip, 1))
-
-    return WeatherData(lat=lat, lon=lon, dates=dates, temp_max=temp_max,
-                       temp_min=temp_min, humidity_max=humidity_max,
-                       humidity_min=humidity_min, wind_speed_max=wind_speed,
-                       precipitation=precipitation)
-
-
-def fetch_weather_single(lat: float, lon: float, forecast_days: int = 3) -> Optional[WeatherData]:
+def fetch_weather_batch(lats: List[float], lons: List[float], forecast_days: int = 3) -> Optional[dict]:
+    """Fetch weather for multiple locations in ONE API call (much faster)."""
     if not REQUESTS_AVAILABLE:
         return None
 
+    # Open-Meteo accepts comma-separated coordinates
     params = {
-        "latitude": lat, "longitude": lon,
+        "latitude": ",".join(f"{lat:.4f}" for lat in lats),
+        "longitude": ",".join(f"{lon:.4f}" for lon in lons),
         "daily": ",".join(REQUIRED_DAILY_VARS),
-        "forecast_days": forecast_days, "timezone": "auto",
+        "forecast_days": forecast_days,
+        "timezone": "auto",
     }
 
     try:
-        response = requests.get(OPEN_METEO_FORECAST_URL, params=params, timeout=30)
+        response = requests.get(OPEN_METEO_FORECAST_URL, params=params, timeout=60)
         response.raise_for_status()
-        data = response.json()
-        daily = data.get("daily", {})
-
-        return WeatherData(
-            lat=lat, lon=lon, dates=daily.get("time", []),
-            temp_max=daily.get("temperature_2m_max", []),
-            temp_min=daily.get("temperature_2m_min", []),
-            humidity_max=daily.get("relative_humidity_2m_max", []),
-            humidity_min=daily.get("relative_humidity_2m_min", []),
-            wind_speed_max=daily.get("wind_speed_10m_max", []),
-            precipitation=daily.get("precipitation_sum", []),
-        )
-    except Exception:
+        return response.json()
+    except Exception as e:
         return None
 
 
-def fetch_grid_weather(grid: Grid, forecast_days: int = 3, simulate: bool = False,
-                       simulation_seed: int = 42, progress_bar: bool = True) -> GridWeatherData:
-    print(f"Fetching weather data for {len(grid.points)} grid points...")
-    print(f"Forecast days: {forecast_days}")
+def fetch_weather_parallel(grid: Grid, forecast_days: int = 3,
+                           batch_size: int = 50, max_workers: int = 8) -> dict:
+    """Fetch weather using parallel batch requests for maximum speed."""
+    n_points = len(grid.points)
+    all_temps = np.zeros(n_points)
+    all_humidity = np.zeros(n_points)
+    all_winds = np.zeros(n_points)
+    all_precip = np.zeros(n_points)
+    valid = np.zeros(n_points, dtype=bool)
 
-    if simulate:
-        print("Using SIMULATED weather data (demo mode)")
-        iterator = tqdm(grid.points, desc="Generating weather") if progress_bar else grid.points
-        weather_data = [generate_simulated_weather(p.lat, p.lon, forecast_days, simulation_seed)
-                        for p in iterator]
-    else:
-        iterator = tqdm(grid.points, desc="Fetching weather") if progress_bar else grid.points
-        weather_data = []
-        for p in iterator:
-            weather = fetch_weather_single(p.lat, p.lon, forecast_days)
-            weather_data.append(weather)
-            time.sleep(0.05)
+    # Split into batches
+    batches = []
+    for i in range(0, n_points, batch_size):
+        end = min(i + batch_size, n_points)
+        batch_lats = [grid.points[j].lat for j in range(i, end)]
+        batch_lons = [grid.points[j].lon for j in range(i, end)]
+        batches.append((i, end, batch_lats, batch_lons))
 
-    valid_weather = [w for w in weather_data if w is not None]
-    print(f"Successfully fetched weather for {len(valid_weather)}/{len(grid.points)} points")
+    print(f"Fetching weather in {len(batches)} batches ({batch_size} points each)...")
 
-    return GridWeatherData(grid=grid, weather_data=weather_data,
-                           fetch_date=datetime.now().isoformat())
+    def fetch_batch(batch_info):
+        start, end, lats, lons = batch_info
+        data = fetch_weather_batch(lats, lons, forecast_days)
+        return start, end, data
 
+    # Parallel fetch
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_batch, b): b for b in batches}
+        pbar = tqdm(total=len(batches), desc="Fetching weather batches")
+        for future in as_completed(futures):
+            results.append(future.result())
+            pbar.update(1)
+        pbar.close()
 
-def extract_day_weather(grid_weather: GridWeatherData, day_index: int = 0) -> Dict[str, np.ndarray]:
-    n_points = len(grid_weather.grid.points)
+    # Process results
+    for start, end, data in results:
+        if data is None:
+            continue
 
-    lats = np.zeros(n_points)
-    lons = np.zeros(n_points)
-    temps = np.zeros(n_points)
-    humidities = np.zeros(n_points)
-    winds = np.zeros(n_points)
-    precips = np.zeros(n_points)
-    valid_mask = np.zeros(n_points, dtype=bool)
-
-    for i, (point, weather) in enumerate(zip(grid_weather.grid.points, grid_weather.weather_data)):
-        lats[i], lons[i] = point.lat, point.lon
-
-        if weather is not None and len(weather.temp_max) > day_index:
-            temps[i] = weather.temp_max[day_index] if weather.temp_max[day_index] else 25.0
-            humidities[i] = weather.humidity_min[day_index] if weather.humidity_min[day_index] else 50.0
-            winds[i] = weather.wind_speed_max[day_index] if weather.wind_speed_max[day_index] else 10.0
-            precips[i] = weather.precipitation[day_index] if weather.precipitation[day_index] else 0.0
-            valid_mask[i] = True
+        # Handle single vs multiple locations response
+        if isinstance(data, list):
+            for i, item in enumerate(data):
+                idx = start + i
+                daily = item.get("daily", {})
+                if daily.get("temperature_2m_max"):
+                    all_temps[idx] = daily["temperature_2m_max"][0] or 25
+                    all_humidity[idx] = daily["relative_humidity_2m_min"][0] or 50
+                    all_winds[idx] = daily["wind_speed_10m_max"][0] or 10
+                    all_precip[idx] = daily["precipitation_sum"][0] or 0
+                    valid[idx] = True
         else:
-            temps[i], humidities[i], winds[i], precips[i] = 25.0, 50.0, 10.0, 0.0
+            # Single location or batch response
+            daily = data.get("daily", {})
+            if daily:
+                # Check if it's a batch response (arrays of arrays)
+                temps = daily.get("temperature_2m_max", [])
+                if temps and isinstance(temps[0], list):
+                    # Batch response - each location has its own array
+                    for i in range(end - start):
+                        idx = start + i
+                        all_temps[idx] = temps[i][0] if temps[i] else 25
+                        all_humidity[idx] = daily["relative_humidity_2m_min"][i][0] if daily["relative_humidity_2m_min"][i] else 50
+                        all_winds[idx] = daily["wind_speed_10m_max"][i][0] if daily["wind_speed_10m_max"][i] else 10
+                        all_precip[idx] = daily["precipitation_sum"][i][0] if daily["precipitation_sum"][i] else 0
+                        valid[idx] = True
+                elif temps:
+                    # Single response for single location
+                    all_temps[start] = temps[0] or 25
+                    all_humidity[start] = daily.get("relative_humidity_2m_min", [50])[0] or 50
+                    all_winds[start] = daily.get("wind_speed_10m_max", [10])[0] or 10
+                    all_precip[start] = daily.get("precipitation_sum", [0])[0] or 0
+                    valid[start] = True
 
-    return {"lats": lats, "lons": lons, "temperatures": temps, "humidities": humidities,
-            "wind_speeds": winds, "precipitations": precips, "valid_mask": valid_mask}
+    return {
+        "temperatures": all_temps,
+        "humidities": all_humidity,
+        "wind_speeds": all_winds,
+        "precipitations": all_precip,
+        "valid_mask": valid,
+    }
+
+
+def generate_simulated_weather_fast(grid: Grid, seed: int = 42) -> dict:
+    """Fast vectorized weather simulation."""
+    np.random.seed(seed)
+    n = len(grid.points)
+
+    # Temperature varies with latitude
+    lat_factor = (grid.lats + 44) / 34
+    base_temps = 20 + lat_factor * 20
+    temps = base_temps + np.random.normal(0, 5, n)
+
+    # Humidity inversely related to latitude factor
+    base_humidity = 80 - lat_factor * 30
+    humidity = np.clip(base_humidity + np.random.uniform(-20, 10, n), 10, 100)
+
+    # Wind speed
+    winds = np.abs(np.random.normal(15, 10, n))
+
+    # Precipitation (mostly dry)
+    precip = np.where(np.random.random(n) < 0.2, np.random.uniform(0.1, 20, n), 0)
+
+    return {
+        "temperatures": temps,
+        "humidities": humidity,
+        "wind_speeds": winds,
+        "precipitations": precip,
+        "valid_mask": np.ones(n, dtype=bool),
+    }
 
 
 # =============================================================================
@@ -467,23 +400,21 @@ def extract_day_weather(grid_weather: GridWeatherData, day_index: int = 0) -> Di
 # =============================================================================
 
 def create_matplotlib_map(lats: np.ndarray, lons: np.ndarray, risk_levels: np.ndarray,
-                          ffdi_values: np.ndarray, title: str = "Fire Risk Map",
-                          output_path: Optional[str] = None) -> Optional[object]:
+                          ffdi_values: np.ndarray, title: str, output_path: str,
+                          bounds: dict) -> None:
     if not MATPLOTLIB_AVAILABLE:
-        print("matplotlib not available. Install with: pip install matplotlib")
-        return None
+        print("matplotlib not available. Install: pip install matplotlib")
+        return
 
-    fig, ax = plt.subplots(figsize=(14, 10))
-
+    fig, ax = plt.subplots(figsize=(12, 10))
     colors = [RISK_COLORS[i] for i in range(6)]
     cmap = mcolors.ListedColormap(colors)
-    bounds = [-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
-    norm = mcolors.BoundaryNorm(bounds, cmap.N)
+    norm = mcolors.BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5, 5.5], cmap.N)
 
-    scatter = ax.scatter(lons, lats, c=risk_levels, cmap=cmap, norm=norm, s=10, alpha=0.8, marker='s')
+    scatter = ax.scatter(lons, lats, c=risk_levels, cmap=cmap, norm=norm, s=15, alpha=0.8, marker='s')
 
-    ax.set_xlim(AUSTRALIA_BOUNDS["min_lon"] - 1, AUSTRALIA_BOUNDS["max_lon"] + 1)
-    ax.set_ylim(AUSTRALIA_BOUNDS["min_lat"] - 1, AUSTRALIA_BOUNDS["max_lat"] + 1)
+    ax.set_xlim(bounds["min_lon"] - 0.5, bounds["max_lon"] + 0.5)
+    ax.set_ylim(bounds["min_lat"] - 0.5, bounds["max_lat"] + 0.5)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(title)
@@ -494,286 +425,190 @@ def create_matplotlib_map(lats: np.ndarray, lons: np.ndarray, risk_levels: np.nd
     cbar.set_label("Fire Danger Rating")
     cbar.ax.set_yticklabels([RISK_LABELS[i] for i in range(6)])
 
-    stats_text = f"FFDI Stats:\nMin: {ffdi_values.min():.1f}\nMax: {ffdi_values.max():.1f}\nMean: {ffdi_values.mean():.1f}"
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+    stats = f"FFDI: Min={ffdi_values.min():.1f}, Max={ffdi_values.max():.1f}, Mean={ffdi_values.mean():.1f}"
+    ax.text(0.02, 0.98, stats, transform=ax.transAxes, fontsize=9,
             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Map saved to: {output_path}")
-
-    return fig
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Map saved: {output_path}")
 
 
 def create_folium_map(lats: np.ndarray, lons: np.ndarray, risk_levels: np.ndarray,
                       ffdi_values: np.ndarray, risk_categories: List[str],
-                      output_path: str = "fire_risk_map.html", use_heatmap: bool = False) -> Optional[object]:
+                      output_path: str, bounds: dict, use_heatmap: bool = False) -> None:
     if not FOLIUM_AVAILABLE:
-        print("folium not available. Install with: pip install folium")
-        return None
+        print("folium not available. Install: pip install folium")
+        return
 
-    center_lat = (AUSTRALIA_BOUNDS["min_lat"] + AUSTRALIA_BOUNDS["max_lat"]) / 2
-    center_lon = (AUSTRALIA_BOUNDS["min_lon"] + AUSTRALIA_BOUNDS["max_lon"]) / 2
+    center_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2
+    center_lon = (bounds["min_lon"] + bounds["max_lon"]) / 2
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=4, tiles='OpenStreetMap')
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles='OpenStreetMap')
 
     if use_heatmap:
-        heat_data = [[lat, lon, ffdi] for lat, lon, ffdi in zip(lats, lons, ffdi_values)]
-        HeatMap(heat_data, radius=15, blur=10, max_zoom=10).add_to(m)
+        HeatMap([[lat, lon, ffdi] for lat, lon, ffdi in zip(lats, lons, ffdi_values)],
+                radius=15, blur=10).add_to(m)
     else:
         for i in range(len(lats)):
-            color = RISK_COLORS[risk_levels[i]]
             folium.CircleMarker(
-                location=[lats[i], lons[i]], radius=3, color=color, fill=True,
-                fillColor=color, fillOpacity=0.7,
+                [lats[i], lons[i]], radius=4, color=RISK_COLORS[risk_levels[i]],
+                fill=True, fillColor=RISK_COLORS[risk_levels[i]], fillOpacity=0.7,
                 popup=f"FFDI: {ffdi_values[i]:.1f}<br>Risk: {risk_categories[i]}"
             ).add_to(m)
 
-    legend_html = '<div style="position:fixed;bottom:50px;left:50px;z-index:1000;background:white;padding:10px;border:2px solid gray;border-radius:5px;font-size:12px;"><b>Fire Danger Rating</b><br>'
-    for level, label in RISK_LABELS.items():
-        legend_html += f'<i style="background:{RISK_COLORS[level]};width:15px;height:15px;display:inline-block;margin-right:5px;"></i>{label}<br>'
-    legend_html += "</div>"
-    m.get_root().html.add_child(folium.Element(legend_html))
+    legend = '<div style="position:fixed;bottom:50px;left:50px;z-index:1000;background:white;padding:10px;border:2px solid gray;border-radius:5px;"><b>Fire Danger</b><br>'
+    for lvl, lbl in RISK_LABELS.items():
+        legend += f'<i style="background:{RISK_COLORS[lvl]};width:12px;height:12px;display:inline-block;margin-right:5px;"></i>{lbl}<br>'
+    legend += '</div>'
+    m.get_root().html.add_child(folium.Element(legend))
 
     m.save(output_path)
-    print(f"Interactive map saved to: {output_path}")
-    return m
+    print(f"Interactive map saved: {output_path}")
 
 
-def export_to_csv(lats: np.ndarray, lons: np.ndarray, risk_levels: np.ndarray,
-                  ffdi_values: np.ndarray, risk_categories: List[str],
-                  weather_data: Optional[Dict] = None, output_path: str = "fire_risk_data.csv") -> None:
-    with open(output_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        header = ["latitude", "longitude", "ffdi", "risk_level", "risk_category"]
-        if weather_data:
-            header.extend(["temperature_c", "humidity_pct", "wind_speed_kmh", "precipitation_mm"])
-        writer.writerow(header)
-
+def export_csv(lats, lons, risk_levels, ffdi_values, risk_categories, weather, path):
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(["lat", "lon", "ffdi", "risk_level", "risk", "temp_c", "humidity", "wind_kmh", "precip_mm"])
         for i in range(len(lats)):
-            row = [f"{lats[i]:.4f}", f"{lons[i]:.4f}", f"{ffdi_values[i]:.2f}",
-                   risk_levels[i], risk_categories[i]]
-            if weather_data:
-                row.extend([f"{weather_data['temperatures'][i]:.1f}",
-                            f"{weather_data['humidities'][i]:.1f}",
-                            f"{weather_data['wind_speeds'][i]:.1f}",
-                            f"{weather_data['precipitations'][i]:.1f}"])
-            writer.writerow(row)
-    print(f"Data exported to: {output_path}")
+            w.writerow([f"{lats[i]:.4f}", f"{lons[i]:.4f}", f"{ffdi_values[i]:.2f}",
+                        risk_levels[i], risk_categories[i], f"{weather['temperatures'][i]:.1f}",
+                        f"{weather['humidities'][i]:.1f}", f"{weather['wind_speeds'][i]:.1f}",
+                        f"{weather['precipitations'][i]:.1f}"])
+    print(f"CSV saved: {path}")
 
 
-def export_to_json(lats: np.ndarray, lons: np.ndarray, risk_levels: np.ndarray,
-                   ffdi_values: np.ndarray, risk_categories: List[str],
-                   metadata: Optional[Dict] = None, output_path: str = "fire_risk_data.json") -> None:
+def export_json(lats, lons, risk_levels, ffdi_values, risk_categories, metadata, path):
     data = {
-        "metadata": metadata or {},
-        "statistics": {
-            "total_points": len(lats),
-            "ffdi_min": float(ffdi_values.min()),
-            "ffdi_max": float(ffdi_values.max()),
-            "ffdi_mean": float(ffdi_values.mean()),
-            "risk_distribution": {RISK_LABELS[i]: int(np.sum(risk_levels == i)) for i in range(6)}
-        },
+        "metadata": metadata,
+        "stats": {"points": len(lats), "ffdi_min": float(ffdi_values.min()),
+                  "ffdi_max": float(ffdi_values.max()), "ffdi_mean": float(ffdi_values.mean())},
         "points": [{"lat": float(lats[i]), "lon": float(lons[i]), "ffdi": float(ffdi_values[i]),
-                    "risk_level": int(risk_levels[i]), "risk_category": risk_categories[i]}
-                   for i in range(len(lats))]
+                    "risk": risk_categories[i]} for i in range(len(lats))]
     }
-    with open(output_path, 'w') as f:
+    with open(path, 'w') as f:
         json.dump(data, f, indent=2)
-    print(f"Data exported to: {output_path}")
+    print(f"JSON saved: {path}")
 
 
-def print_risk_summary(risk_levels: np.ndarray, ffdi_values: np.ndarray, title: str = "Fire Risk Summary") -> None:
-    print("\n" + "=" * 50)
-    print(title)
+def print_summary(risk_levels, ffdi_values, title):
+    print(f"\n{'='*50}\n{title}\n{'='*50}")
+    print(f"Points: {len(risk_levels)} | FFDI: {ffdi_values.min():.1f}-{ffdi_values.max():.1f} (mean: {ffdi_values.mean():.1f})")
+    print("\nRisk Distribution:")
+    for lvl in range(6):
+        cnt = np.sum(risk_levels == lvl)
+        pct = cnt / len(risk_levels) * 100
+        print(f"  {RISK_LABELS[lvl]:15s}: {cnt:5d} ({pct:5.1f}%) {'#' * int(pct/2)}")
+    if np.any(risk_levels >= 3):
+        print(f"\n*** HIGH RISK AREAS: {np.sum(risk_levels >= 3)} points at Severe or above ***")
     print("=" * 50)
-    print(f"\nTotal grid points analyzed: {len(risk_levels)}")
-    print(f"\nFFDI Statistics:")
-    print(f"  Minimum: {ffdi_values.min():.2f}")
-    print(f"  Maximum: {ffdi_values.max():.2f}")
-    print(f"  Mean: {ffdi_values.mean():.2f}")
-    print(f"  Median: {np.median(ffdi_values):.2f}")
-    print(f"\nRisk Level Distribution:")
-    for level in range(6):
-        count = np.sum(risk_levels == level)
-        pct = (count / len(risk_levels)) * 100
-        bar = "#" * int(pct / 2)
-        print(f"  {RISK_LABELS[level]:15s}: {count:6d} ({pct:5.1f}%) {bar}")
-
-    high_risk_mask = risk_levels >= 3
-    if np.any(high_risk_mask):
-        print(f"\n*** High-risk areas (Severe or above): {np.sum(high_risk_mask)} points ***")
-    print("=" * 50 + "\n")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-def parse_args():
+def main():
     parser = argparse.ArgumentParser(
-        description="Calculate fire risk across Australia using Open-Meteo weather data",
+        description="Fast fire risk calculator for Australia (defaults to Victoria)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python fire_risk_map.py --simulate --city Sydney --interactive
-  python fire_risk_map.py --simulate --resolution 100
-  python fire_risk_map.py --city Melbourne --radius 75 --csv --json
+  python fire_risk_map.py --simulate --interactive          # Victoria with simulated data
+  python fire_risk_map.py --city Melbourne --interactive    # Melbourne region
+  python fire_risk_map.py --region nsw --resolution 25      # NSW at 25km
+  python fire_risk_map.py --region australia --resolution 100  # All Australia
 
-Available cities: Sydney, Melbourne, Brisbane, Perth, Adelaide, Darwin, Hobart, Canberra
-        """
-    )
+Regions: victoria, nsw, queensland, south_australia, western_australia, tasmania, nt, australia
+Cities: Sydney, Melbourne, Brisbane, Perth, Adelaide, Darwin, Hobart, Canberra, Geelong, Ballarat, Bendigo
+        """)
 
-    parser.add_argument("--resolution", "-r", type=float, default=50.0,
-                        help="Grid resolution in km (default: 50km)")
-    parser.add_argument("--city", "-c", type=str, choices=list(AUSTRALIAN_CITIES.keys()),
-                        help="Focus on specific city region (uses 5km resolution by default)")
+    parser.add_argument("--region", "-r", default="victoria", choices=list(REGION_BOUNDS.keys()),
+                        help="Region to analyze (default: victoria)")
+    parser.add_argument("--resolution", type=float, default=5.0,
+                        help="Grid resolution in km (default: 5km)")
+    parser.add_argument("--city", "-c", choices=list(AUSTRALIAN_CITIES.keys()),
+                        help="Focus on city region instead")
     parser.add_argument("--radius", type=float, default=50.0,
-                        help="Radius around city in km (default: 50km)")
-    parser.add_argument("--days", "-d", type=int, default=3, choices=range(1, 17),
-                        help="Number of forecast days (1-16, default: 3)")
-    parser.add_argument("--day-index", type=int, default=0,
-                        help="Which day to visualize (0=today, 1=tomorrow, etc.)")
-    parser.add_argument("--output-dir", "-o", type=str, default="./output",
-                        help="Output directory (default: ./output)")
-    parser.add_argument("--no-map", action="store_true", help="Skip PNG map generation")
-    parser.add_argument("--csv", action="store_true", help="Export to CSV")
-    parser.add_argument("--json", action="store_true", help="Export to JSON")
-    parser.add_argument("--interactive", action="store_true", help="Generate interactive HTML map")
-    parser.add_argument("--heatmap", action="store_true", help="Use heatmap style for interactive map")
-    parser.add_argument("--simulate", action="store_true",
-                        help="Use simulated weather data (demo mode, no API required)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for simulation (default: 42)")
-    parser.add_argument("--estimate-only", action="store_true",
-                        help="Only estimate grid size without fetching data")
+                        help="Radius around city in km (default: 50)")
+    parser.add_argument("--output-dir", "-o", default="./output", help="Output directory")
+    parser.add_argument("--no-map", action="store_true", help="Skip PNG map")
+    parser.add_argument("--csv", action="store_true", help="Export CSV")
+    parser.add_argument("--json", action="store_true", help="Export JSON")
+    parser.add_argument("--interactive", action="store_true", help="Generate HTML map")
+    parser.add_argument("--heatmap", action="store_true", help="Use heatmap style")
+    parser.add_argument("--simulate", action="store_true", help="Use simulated data (no API)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for simulation")
 
-    return parser.parse_args()
+    args = parser.parse_args()
 
+    print(f"\n{'='*60}\nFIRE RISK MAP - {datetime.now().strftime('%Y-%m-%d %H:%M')}\n{'='*60}")
 
-def main():
-    args = parse_args()
-
-    print("\n" + "=" * 60)
-    print("AUSTRALIA FIRE RISK MAP GENERATOR")
-    print("=" * 60)
-    print(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # Determine grid parameters
+    # Determine bounds
     if args.city:
-        print(f"\nRegion: {args.city} (radius: {args.radius}km)")
-        resolution = 5.0 if args.resolution == 50.0 else args.resolution
+        region_name = args.city
+        grid = get_city_grid(args.city, args.radius, args.resolution)
+        bounds = {"min_lat": grid.lats.min(), "max_lat": grid.lats.max(),
+                  "min_lon": grid.lons.min(), "max_lon": grid.lons.max()}
     else:
-        print(f"\nRegion: Full Australia")
-        resolution = args.resolution
-    print(f"Resolution: {resolution}km")
+        region_name = args.region.upper()
+        bounds = REGION_BOUNDS[args.region]
+        grid = generate_grid(args.resolution, bounds)
 
-    # Estimate grid size
-    if args.city:
-        grid = get_city_grid(args.city, args.radius, resolution)
-        estimate = {"total_points": len(grid.points), "n_rows": grid.n_rows, "n_cols": grid.n_cols}
-    else:
-        estimate = estimate_grid_size(resolution)
+    print(f"Region: {region_name} | Resolution: {args.resolution}km | Points: {len(grid.points)}")
 
-    print(f"\nGrid size: {estimate.get('n_rows', 'N/A')} x {estimate.get('n_cols', 'N/A')}")
-    print(f"Total points: {estimate['total_points']:,}")
+    # Fetch weather
+    print("\n--- Fetching Weather Data ---")
+    start_time = time.time()
 
-    if args.estimate_only:
-        print("\n(Estimate only mode - exiting)")
-        return 0
-
-    # Generate grid
-    print("\n" + "-" * 40)
-    print("Step 1: Generating grid...")
-    if args.city:
-        grid = get_city_grid(args.city, args.radius, resolution)
-    else:
-        grid = generate_australia_grid(resolution)
-    print(f"Generated {len(grid.points)} grid points")
-
-    # Fetch weather data
-    print("\n" + "-" * 40)
     if args.simulate:
-        print("Step 2: Generating simulated weather data (demo mode)...")
+        print("Using SIMULATED data (demo mode)")
+        weather = generate_simulated_weather_fast(grid, args.seed)
     else:
-        print("Step 2: Fetching weather data from Open-Meteo...")
-    grid_weather = fetch_grid_weather(grid, forecast_days=args.days,
-                                       simulate=args.simulate, simulation_seed=args.seed)
+        weather = fetch_weather_parallel(grid, forecast_days=3)
 
-    # Extract weather for specified day
-    print("\n" + "-" * 40)
-    print(f"Step 3: Extracting weather for day {args.day_index}...")
-    day_weather = extract_day_weather(grid_weather, args.day_index)
-    valid_count = np.sum(day_weather["valid_mask"])
-    print(f"Valid weather data points: {valid_count}/{len(grid.points)}")
+    fetch_time = time.time() - start_time
+    valid_pct = np.sum(weather["valid_mask"]) / len(grid.points) * 100
+    print(f"Completed in {fetch_time:.1f}s | Valid data: {valid_pct:.1f}%")
 
     # Calculate fire risk
-    print("\n" + "-" * 40)
-    print("Step 4: Calculating fire risk (FFDI)...")
-    ffdi_values, risk_levels, risk_categories = calculate_fire_risk_batch(
-        day_weather["temperatures"], day_weather["humidities"],
-        day_weather["wind_speeds"], day_weather["precipitations"]
-    )
+    print("\n--- Calculating Fire Risk ---")
+    ffdi = calculate_ffdi_vectorized(weather["temperatures"], weather["humidities"],
+                                      weather["wind_speeds"], weather["precipitations"])
+    risk_levels, risk_categories = get_risk_levels(ffdi)
 
-    # Print summary
-    day_label = ["Today", "Tomorrow", "Day 3"][args.day_index] if args.day_index < 3 else f"Day {args.day_index + 1}"
-    title = f"Fire Risk Summary - {args.city or 'Australia'} - {day_label}"
-    print_risk_summary(risk_levels, ffdi_values, title)
-
-    # Create output directory
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    region = args.city.lower() if args.city else "australia"
+    print_summary(risk_levels, ffdi, f"Fire Risk - {region_name}")
 
     # Generate outputs
-    print("\n" + "-" * 40)
-    print("Step 5: Generating outputs...")
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    prefix = f"fire_risk_{region_name.lower()}_{ts}"
+
+    print("\n--- Generating Outputs ---")
 
     if not args.no_map:
-        map_path = output_dir / f"fire_risk_{region}_{timestamp}.png"
-        fig = create_matplotlib_map(day_weather["lats"], day_weather["lons"],
-                                    risk_levels, ffdi_values,
-                                    title=f"Fire Risk Map - {args.city or 'Australia'} - {day_label}",
-                                    output_path=str(map_path))
-        if fig:
-            plt.close(fig)
+        create_matplotlib_map(grid.lats, grid.lons, risk_levels, ffdi,
+                              f"Fire Risk - {region_name}", str(output_dir / f"{prefix}.png"), bounds)
 
     if args.interactive:
-        html_path = output_dir / f"fire_risk_{region}_{timestamp}.html"
-        create_folium_map(day_weather["lats"], day_weather["lons"],
-                          risk_levels, ffdi_values, risk_categories,
-                          output_path=str(html_path), use_heatmap=args.heatmap)
+        create_folium_map(grid.lats, grid.lons, risk_levels, ffdi, risk_categories,
+                          str(output_dir / f"{prefix}.html"), bounds, args.heatmap)
 
     if args.csv:
-        csv_path = output_dir / f"fire_risk_{region}_{timestamp}.csv"
-        export_to_csv(day_weather["lats"], day_weather["lons"],
-                      risk_levels, ffdi_values, risk_categories,
-                      weather_data=day_weather, output_path=str(csv_path))
+        export_csv(grid.lats, grid.lons, risk_levels, ffdi, risk_categories, weather,
+                   str(output_dir / f"{prefix}.csv"))
 
     if args.json:
-        json_path = output_dir / f"fire_risk_{region}_{timestamp}.json"
-        metadata = {
-            "region": args.city or "Australia",
-            "resolution_km": resolution,
-            "forecast_day": args.day_index,
-            "generated_at": datetime.now().isoformat(),
-            "data_source": "Simulated Data" if args.simulate else "Open-Meteo API",
-            "simulated": args.simulate,
-        }
-        export_to_json(day_weather["lats"], day_weather["lons"],
-                       risk_levels, ffdi_values, risk_categories,
-                       metadata=metadata, output_path=str(json_path))
+        export_json(grid.lats, grid.lons, risk_levels, ffdi, risk_categories,
+                    {"region": region_name, "resolution_km": args.resolution,
+                     "simulated": args.simulate, "generated": datetime.now().isoformat()},
+                    str(output_dir / f"{prefix}.json"))
 
-    print("\n" + "=" * 60)
-    print("FIRE RISK ANALYSIS COMPLETE!")
-    print(f"Output directory: {output_dir.absolute()}")
-    print("=" * 60 + "\n")
-
-    return 0
+    print(f"\n{'='*60}\nDONE! Output: {output_dir.absolute()}\n{'='*60}\n")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
